@@ -1,11 +1,11 @@
 #!/bin/bash
 
 echo "=========================================="
-echo "Switch to Internal Network Helper"
+echo "Switch to Bridge Adapter Helper"
 echo "=========================================="
 echo
 echo "This script will help you configure static IP"
-echo "after switching from NAT to Internal Network"
+echo "after switching from NAT to Bridge Adapter"
 echo
 
 # Detect network interface
