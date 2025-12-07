@@ -1,348 +1,133 @@
 #!/bin/bash
 
-# Exit on any error
-set -e
-
+echo "=========================================="
+echo "Switch to Internal Network Helper"
+echo "=========================================="
 echo
-echo "#################################"
-echo "LibreNMS Installation with LDAP"
-echo "#################################"
-echo
-
-# Input database password & hostname
-read -sp "Enter MySQL database password for librenms user: " DATABASEPASSWORD
-echo
-read -p "Enter web server hostname: " WEBSERVERHOSTNAME
+echo "This script will help you configure static IP"
+echo "after switching from NAT to Internal Network"
 echo
 
-# Input LDAP configuration
-echo
-echo "=== LDAP Configuration ==="
-echo "LDAP Server: 192.168.1.15 (fixed)"
-LDAP_SERVER="192.168.1.15"
-read -p "LDAP Port (default 389): " LDAP_PORT
-LDAP_PORT=${LDAP_PORT:-389}
-read -p "Use LDAPS/TLS? (yes/no, default no): " LDAP_TLS
-LDAP_TLS=${LDAP_TLS:-no}
-read -p "Base DN (e.g., dc=example,dc=com): " LDAP_BASEDN
-read -p "Bind User DN (e.g., cn=admin,dc=example,dc=com): " LDAP_BINDUSER
-read -sp "Bind User Password: " LDAP_BINDPASS
-echo
-read -p "User DN/OU (e.g., ou=users,dc=example,dc=com): " LDAP_USERDN
-read -p "User filter (default: uid=): " LDAP_USERFILTER
-LDAP_USERFILTER=${LDAP_USERFILTER:-uid=}
-read -p "Group DN (optional, press enter to skip): " LDAP_GROUPDN
-read -p "Admin Group CN (optional, e.g., librenms-admins): " LDAP_ADMIN_GROUP
-
-echo
-echo "############################"
-echo "Installing required packages"
-echo "############################" 
+# Detect network interface
+INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+if [ -z "$INTERFACE" ]; then
+    INTERFACE="ens33"
+    echo "Could not detect interface, using default: $INTERFACE"
+else
+    echo "Detected network interface: $INTERFACE"
+fi
 echo
 
-apt update
-apt install -y acl curl fping git graphviz imagemagick mariadb-client mariadb-server mtr-tiny nginx-full nmap \
-php-cli php-curl php-fpm php-gd php-gmp php-json php-mbstring php-mysql php-snmp php-xml php-zip php-ldap \
-rrdtool snmp snmpd unzip python3-command-runner python3-pymysql python3-dotenv python3-redis \
-python3-setuptools python3-psutil python3-systemd python3-pip whois traceroute iputils-ping tcpdump vim cron
+# Input static IP configuration
+read -p "Enter static IP address (e.g., 192.168.1.20): " STATIC_IP
+read -p "Enter subnet prefix (default 24 for /24): " PREFIX
+PREFIX=${PREFIX:-24}
+read -p "Enter gateway IP (e.g., 192.168.1.1): " GATEWAY
+read -p "Enter DNS server (default 192.168.1.1): " DNS
+DNS=${DNS:-$GATEWAY}
 
 echo
-echo "######################"
-echo "Creating librenms user"
-echo "######################"
-useradd librenms -d /opt/librenms -M -r -s "$(which bash)"
-
-echo "###########################"
-echo "Cloning LibreNMS repository"
-echo "###########################"
-cd /opt
-git clone https://github.com/librenms/librenms.git
-
+echo "Configuration summary:"
+echo "  Interface: $INTERFACE"
+echo "  IP: $STATIC_IP/$PREFIX"
+echo "  Gateway: $GATEWAY"
+echo "  DNS: $DNS"
 echo
-echo "############################################"
-echo "Setting permissions for LibreNMS directories"
-echo "############################################"
-chown -R librenms:librenms /opt/librenms
-chmod 771 /opt/librenms
-setfacl -d -m g::rwx /opt/librenms/rrd /opt/librenms/logs /opt/librenms/bootstrap/cache/ /opt/librenms/storage/
-setfacl -R -m g::rwx /opt/librenms/rrd /opt/librenms/logs /opt/librenms/bootstrap/cache/ /opt/librenms/storage/
+read -p "Is this correct? (yes/no): " CONFIRM
 
-echo "################################"
-echo "Installing Composer dependencies"
-echo "################################"
-su - librenms -c "/opt/librenms/scripts/composer_wrapper.php install --no-dev"
+if [ "$CONFIRM" != "yes" ]; then
+    echo "Cancelled. Please run the script again."
+    exit 1
+fi
 
+# Backup existing netplan config
 echo
-echo "########################"
-echo "Configuring PHP timezone"
-echo "########################"
-sed -i 's/;date.timezone =/date.timezone = Asia\/Makassar/' /etc/php/8.3/fpm/php.ini
-sed -i 's/;date.timezone =/date.timezone = Asia\/Makassar/' /etc/php/8.3/cli/php.ini
+echo "Backing up existing netplan config..."
+cp /etc/netplan/*.yaml /etc/netplan/backup-$(date +%Y%m%d-%H%M%S).yaml 2>/dev/null || true
 
-echo
-echo "#############################################"
-echo "Setting system timezone to Asia/Makassar"
-echo "#############################################"
-timedatectl set-timezone Asia/Makassar
+# Create new netplan config
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+echo "Creating new netplan configuration..."
 
-echo "############################"
-echo "Configuring MariaDB settings"
-echo "############################"
-sed -i '/\[mysqld\]/a \
-innodb_file_per_table=1 \
-lower_case_table_names=0' /etc/mysql/mariadb.conf.d/50-server.cnf
-
-echo "###############################"
-echo "Enabling and restarting MariaDB"
-echo "###############################"
-systemctl enable mariadb
-systemctl restart mariadb
-
-echo
-echo "###################################"
-echo "Creating LibreNMS database and user"
-echo "###################################"
-mysql -u root <<EOF
-CREATE DATABASE librenms CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'librenms'@'localhost' IDENTIFIED BY '$DATABASEPASSWORD';
-GRANT ALL PRIVILEGES ON librenms.* TO 'librenms'@'localhost';
-FLUSH PRIVILEGES;
+cat > $NETPLAN_FILE <<EOF
+network:
+  version: 2
+  ethernets:
+    $INTERFACE:
+      addresses:
+        - $STATIC_IP/$PREFIX
+      routes:
+        - to: default
+          via: $GATEWAY
+      nameservers:
+        addresses:
+          - $DNS
+          - 8.8.8.8
 EOF
 
+echo "✓ Netplan config created at: $NETPLAN_FILE"
 echo
-echo "#####################################"
-echo "Configuring PHP-FPM pool for LibreNMS"
-echo "#####################################"
-cp /etc/php/8.3/fpm/pool.d/www.conf /etc/php/8.3/fpm/pool.d/librenms.conf
-sed -i 's/user = www-data/user = librenms/' /etc/php/8.3/fpm/pool.d/librenms.conf
-sed -i 's/group = www-data/group = librenms/' /etc/php/8.3/fpm/pool.d/librenms.conf
-sed -i 's/\[www\]/\[librenms\]/' /etc/php/8.3/fpm/pool.d/librenms.conf
-sed -i 's|listen = /run/php/php8.3-fpm.sock|listen = /run/php-fpm-librenms.sock|' /etc/php/8.3/fpm/pool.d/librenms.conf
 
-systemctl restart php8.3-fpm
-sleep 2
-
-echo
-echo "##############################"
-echo "Configuring Nginx for LibreNMS"
-echo "##############################"
-cat << EOF > /etc/nginx/conf.d/librenms.conf
-server {
- listen      80;
- server_name $WEBSERVERHOSTNAME;
- root        /opt/librenms/html;
- index       index.php;
-
- charset utf-8;
- gzip on;
- gzip_types text/css application/javascript text/javascript application/x-javascript image/svg+xml text/plain text/xsd text/xsl text/xml image/x-icon;
-
- location / {
-  try_files \$uri \$uri/ /index.php?\$query_string;
- }
-
- location ~ [^/]\.php(/|$) {
-  fastcgi_pass unix:/run/php-fpm-librenms.sock;
-  fastcgi_split_path_info ^(.+\.php)(/.+)$;
-  include fastcgi.conf;
- }
-
- location ~ /\.(?!well-known).* {
-  deny all;
- }
-}
-EOF
-
-echo
-echo "####################################"
-echo "Removing default Nginx configuration"
-echo "####################################"
-rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
-
-chown -R www-data:www-data /opt/librenms/html
-chmod -R 755 /opt/librenms/html
-
-nginx -t
-
-echo
-echo "Restarting Nginx..."
-systemctl restart nginx
-
-echo "#######################"
-echo "Setting up lnms command"
-echo "#######################"
-ln -s /opt/librenms/lnms /usr/bin/lnms
-cp /opt/librenms/misc/lnms-completion.bash /etc/bash_completion.d/
-
-echo "################"
-echo "Configuring SNMP"
-echo "################"
-cp /opt/librenms/snmpd.conf.example /etc/snmp/snmpd.conf
-sed -i 's/RANDOMSTRINGGOESHERE/public/' /etc/snmp/snmpd.conf
-curl -o /usr/bin/distro https://raw.githubusercontent.com/librenms/librenms-agent/master/snmp/distro
-chmod +x /usr/bin/distro
-systemctl enable snmpd
-systemctl restart snmpd
-
-cp /opt/librenms/dist/librenms.cron /etc/cron.d/librenms
-
-echo
-echo "#############################"
-echo "Setting up LibreNMS scheduler"
-echo "#############################"
-cp /opt/librenms/dist/librenms-scheduler.service /opt/librenms/dist/librenms-scheduler.timer /etc/systemd/system/
-systemctl enable librenms-scheduler.timer
-systemctl start librenms-scheduler.timer
-
-echo
-echo "##################################"
-echo "Configuring logrotate for LibreNMS"
-echo "##################################"
-cp /opt/librenms/misc/librenms.logrotate /etc/logrotate.d/librenms
-
-echo
-echo "#######################"
-echo "Fixing up the .env file"
-echo "#######################"
-sed -i "s/#DB_HOST=/DB_HOST=localhost/" /opt/librenms/.env
-sed -i "s/#DB_DATABASE=/DB_DATABASE=librenms/" /opt/librenms/.env
-sed -i "s/#DB_USERNAME=/DB_USERNAME=librenms/" /opt/librenms/.env
-sed -i "s/#DB_PASSWORD=/DB_PASSWORD=$DATABASEPASSWORD/" /opt/librenms/.env
-
-echo
-echo "##############################"
-echo "Configuring LDAP in config.php"
-echo "##############################"
-
-# Escape special characters for sed
-LDAP_BINDPASS_ESCAPED=$(printf '%s\n' "$LDAP_BINDPASS" | sed 's/[[\.*^$/]/\\&/g')
-
-# Determine encryption setting
-if [ "$LDAP_TLS" = "yes" ]; then
-    LDAP_ENCRYPTION="'encryption' => 'tls',"
+# Test netplan config
+echo "Testing netplan configuration..."
+if netplan try --timeout 10; then
+    echo "✓ Netplan configuration is valid"
 else
-    LDAP_ENCRYPTION="'encryption' => false,"
+    echo "✗ Netplan configuration has errors"
+    echo "Restoring backup..."
+    cp /etc/netplan/backup-*.yaml $NETPLAN_FILE
+    exit 1
 fi
-
-# Create config.php with LDAP settings
-cat << EOFCONFIG > /opt/librenms/config.php
-<?php
-
-\$config['auth_mechanism'] = 'ldap';
-
-\$config['auth_ldap_version'] = 3;
-\$config['auth_ldap_server'] = '$LDAP_SERVER';
-\$config['auth_ldap_port'] = $LDAP_PORT;
-\$config['auth_ldap_starttls'] = 'optional';
-$LDAP_ENCRYPTION
-
-\$config['auth_ldap_prefix'] = '';
-\$config['auth_ldap_suffix'] = '';
-
-\$config['auth_ldap_binduser'] = '$LDAP_BINDUSER';
-\$config['auth_ldap_binddn'] = '$LDAP_BINDUSER';
-\$config['auth_ldap_bindpassword'] = '$LDAP_BINDPASS';
-
-\$config['auth_ldap_userdn'] = '$LDAP_USERDN';
-\$config['auth_ldap_attr']['uid'] = '$LDAP_USERFILTER';
-
-\$config['auth_ldap_debug'] = false;
-\$config['auth_ldap_timeout'] = 5;
-\$config['auth_ldap_cache_ttl'] = 300;
-
-// Create users automatically on login
-\$config['auth_ldap_autocreate_users'] = true;
-
-EOFCONFIG
-
-# Add group configuration if provided
-if [ -n "$LDAP_GROUPDN" ]; then
-    cat << EOFCONFIG >> /opt/librenms/config.php
-// Group configuration
-\$config['auth_ldap_groups']['$LDAP_BASEDN']['group_filter'] = '(objectClass=groupOfNames)';
-\$config['auth_ldap_groups']['$LDAP_BASEDN']['group_member_attr'] = 'member';
-\$config['auth_ldap_groups']['$LDAP_BASEDN']['group_member_type'] = 'fulldn';
-
-EOFCONFIG
-fi
-
-# Add admin group if provided
-if [ -n "$LDAP_ADMIN_GROUP" ]; then
-    cat << EOFCONFIG >> /opt/librenms/config.php
-// Admin group mapping
-\$config['auth_ldap_group'] = ['$LDAP_ADMIN_GROUP'];
-\$config['auth_ldap_groupbase'] = '$LDAP_GROUPDN';
-
-EOFCONFIG
-fi
-
-# Close PHP tag
-echo "?>" >> /opt/librenms/config.php
-
-chown librenms:librenms /opt/librenms/config.php
-chmod 640 /opt/librenms/config.php
 
 echo
-echo "#####################"
-echo "Testing LDAP connection"
-echo "#####################"
+echo "Applying network configuration..."
+netplan apply
 
-# Install ldap-utils for testing
-apt-get install -y ldap-utils
+sleep 3
 
-echo "Testing LDAP bind..."
-if ldapsearch -x -H ldap://$LDAP_SERVER:$LDAP_PORT -D "$LDAP_BINDUSER" -w "$LDAP_BINDPASS" -b "$LDAP_BASEDN" -s base >/dev/null 2>&1; then
-    echo "✓ LDAP connection successful!"
+# Test connectivity
+echo
+echo "Testing connectivity..."
+echo
+
+echo "[1/3] Testing gateway..."
+if ping -c 2 -W 2 $GATEWAY >/dev/null 2>&1; then
+    echo "✓ Gateway ($GATEWAY) is reachable"
 else
-    echo "✗ WARNING: LDAP connection test failed. Please verify your LDAP settings."
-    echo "  You can test manually with:"
-    echo "  ldapsearch -x -H ldap://$LDAP_SERVER:$LDAP_PORT -D \"$LDAP_BINDUSER\" -w \"password\" -b \"$LDAP_BASEDN\""
+    echo "✗ Gateway ($GATEWAY) is NOT reachable"
 fi
 
 echo
-echo "#####################"
-echo "Fixing log permission"
-echo "#####################"
-while true; do
-  if [ -f /opt/librenms/logs/librenms.log ]; then
-    chown librenms:librenms /opt/librenms/logs/librenms.log
-    break
-  else
-    echo "Waiting until log file appears to change permission..."
-    sleep 1
-  fi
-done
+echo "[2/3] Testing LDAP server (192.168.1.15)..."
+if ping -c 2 -W 2 192.168.1.15 >/dev/null 2>&1; then
+    echo "✓ LDAP server (192.168.1.15) is reachable"
+else
+    echo "✗ LDAP server (192.168.1.15) is NOT reachable"
+    echo "  Check your network configuration and LDAP server"
+fi
 
 echo
-echo "======================================"
-echo "LibreNMS Installation Complete!"
-echo "======================================"
-echo
-echo "LDAP Configuration Summary:"
-echo "  Server: $LDAP_SERVER:$LDAP_PORT"
-echo "  Base DN: $LDAP_BASEDN"
-echo "  User DN: $LDAP_USERDN"
-echo "  Bind User: $LDAP_BINDUSER"
-if [ -n "$LDAP_GROUPDN" ]; then
-    echo "  Group DN: $LDAP_GROUPDN"
+echo "[3/3] Testing LDAP port 389..."
+if timeout 5 bash -c "cat < /dev/null > /dev/tcp/192.168.1.15/389" 2>/dev/null; then
+    echo "✓ LDAP port 389 is accessible"
+else
+    echo "✗ LDAP port 389 is NOT accessible"
+    echo "  Check firewall on LDAP server"
 fi
-if [ -n "$LDAP_ADMIN_GROUP" ]; then
-    echo "  Admin Group: $LDAP_ADMIN_GROUP"
-fi
-echo
-echo "Next Steps:"
-echo "1. Open http://$WEBSERVERHOSTNAME in your browser"
-echo "2. Complete the web setup wizard"
-echo "3. Try logging in with your LDAP credentials"
-echo
-echo "To enable debug mode for LDAP troubleshooting, edit /opt/librenms/config.php:"
-echo "  \$config['auth_ldap_debug'] = true;"
-echo
-echo "Check LDAP debug logs:"
-echo "  tail -f /opt/librenms/logs/librenms.log | grep -i ldap"
-echo
-echo "To validate the installation:"
-echo "  su librenms -c '/opt/librenms/validate.php'"
-echo
 
-exit 0
+echo
+echo "=========================================="
+echo "Network Configuration Complete"
+echo "=========================================="
+echo
+echo "Current IP: $STATIC_IP"
+echo "You can now access LibreNMS at: http://$STATIC_IP"
+echo
+echo "Next steps:"
+echo "1. Open browser to: http://$STATIC_IP"
+echo "2. Complete web installation wizard"
+echo "3. Login with LDAP credentials"
+echo
+echo "If you need to test LDAP manually:"
+echo "  ldapsearch -x -H ldap://192.168.1.15:389 -D \"cn=admin,dc=example,dc=com\" -w \"password\" -b \"dc=example,dc=com\""
+echo
