@@ -1,133 +1,224 @@
 #!/bin/bash
 
 echo "=========================================="
-echo "Switch to Bridge Adapter Helper"
+echo "LibreNMS 502 Bad Gateway Troubleshooter"
 echo "=========================================="
 echo
-echo "This script will help you configure static IP"
-echo "after switching from NAT to Bridge Adapter"
-echo
 
-# Detect network interface
-INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-if [ -z "$INTERFACE" ]; then
-    INTERFACE="ens33"
-    echo "Could not detect interface, using default: $INTERFACE"
+# Check 1: PHP-FPM Service Status
+echo "[1/8] Checking PHP-FPM service status..."
+if systemctl is-active --quiet php8.3-fpm; then
+    echo "✓ PHP-FPM is running"
 else
-    echo "Detected network interface: $INTERFACE"
+    echo "✗ PHP-FPM is NOT running"
+    echo "  Starting PHP-FPM..."
+    systemctl start php8.3-fpm
+    sleep 2
+    if systemctl is-active --quiet php8.3-fpm; then
+        echo "✓ PHP-FPM started successfully"
+    else
+        echo "✗ Failed to start PHP-FPM"
+        echo "  Check error: systemctl status php8.3-fpm"
+        exit 1
+    fi
 fi
 echo
 
-# Input static IP configuration
-read -p "Enter static IP address (e.g., 192.168.1.20): " STATIC_IP
-read -p "Enter subnet prefix (default 24 for /24): " PREFIX
-PREFIX=${PREFIX:-24}
-read -p "Enter gateway IP (e.g., 192.168.1.1): " GATEWAY
-read -p "Enter DNS server (default 192.168.1.1): " DNS
-DNS=${DNS:-$GATEWAY}
-
+# Check 2: PHP-FPM Socket File
+echo "[2/8] Checking PHP-FPM socket file..."
+if [ -S /run/php-fpm-librenms.sock ]; then
+    echo "✓ Socket file exists: /run/php-fpm-librenms.sock"
+    ls -la /run/php-fpm-librenms.sock
+else
+    echo "✗ Socket file NOT found: /run/php-fpm-librenms.sock"
+    echo "  This is the main problem!"
+    echo
+    echo "Checking PHP-FPM pool configuration..."
+    if [ -f /etc/php/8.3/fpm/pool.d/librenms.conf ]; then
+        echo "✓ Pool config exists"
+        echo "  Socket path in config:"
+        grep "listen = " /etc/php/8.3/fpm/pool.d/librenms.conf
+    else
+        echo "✗ Pool config NOT found"
+        echo "  Creating librenms pool config..."
+        
+        cp /etc/php/8.3/fpm/pool.d/www.conf /etc/php/8.3/fpm/pool.d/librenms.conf
+        sed -i 's/user = www-data/user = librenms/' /etc/php/8.3/fpm/pool.d/librenms.conf
+        sed -i 's/group = www-data/group = librenms/' /etc/php/8.3/fpm/pool.d/librenms.conf
+        sed -i 's/\[www\]/\[librenms\]/' /etc/php/8.3/fpm/pool.d/librenms.conf
+        sed -i 's|listen = /run/php/php8.3-fpm.sock|listen = /run/php-fpm-librenms.sock|' /etc/php/8.3/fpm/pool.d/librenms.conf
+        
+        echo "✓ Pool config created"
+    fi
+    
+    echo "  Restarting PHP-FPM..."
+    systemctl restart php8.3-fpm
+    sleep 3
+    
+    if [ -S /run/php-fpm-librenms.sock ]; then
+        echo "✓ Socket file now exists!"
+    else
+        echo "✗ Socket file still not created"
+        echo "  Checking PHP-FPM error log..."
+        tail -20 /var/log/php8.3-fpm.log
+        exit 1
+    fi
+fi
 echo
-echo "Configuration summary:"
-echo "  Interface: $INTERFACE"
-echo "  IP: $STATIC_IP/$PREFIX"
-echo "  Gateway: $GATEWAY"
-echo "  DNS: $DNS"
-echo
-read -p "Is this correct? (yes/no): " CONFIRM
 
-if [ "$CONFIRM" != "yes" ]; then
-    echo "Cancelled. Please run the script again."
+# Check 3: Socket Permissions
+echo "[3/8] Checking socket permissions..."
+SOCKET_PERMS=$(stat -c "%a" /run/php-fpm-librenms.sock 2>/dev/null)
+SOCKET_OWNER=$(stat -c "%U:%G" /run/php-fpm-librenms.sock 2>/dev/null)
+echo "  Permissions: $SOCKET_PERMS"
+echo "  Owner: $SOCKET_OWNER"
+
+if [ "$SOCKET_PERMS" != "660" ] && [ "$SOCKET_PERMS" != "666" ]; then
+    echo "  Warning: Permissions might be too restrictive"
+    echo "  Fixing permissions..."
+    chmod 660 /run/php-fpm-librenms.sock
+fi
+echo
+
+# Check 4: Nginx Service Status
+echo "[4/8] Checking Nginx service status..."
+if systemctl is-active --quiet nginx; then
+    echo "✓ Nginx is running"
+else
+    echo "✗ Nginx is NOT running"
+    echo "  Starting Nginx..."
+    systemctl start nginx
+fi
+echo
+
+# Check 5: Nginx Configuration
+echo "[5/8] Checking Nginx configuration..."
+if nginx -t 2>&1 | grep -q "successful"; then
+    echo "✓ Nginx configuration is valid"
+else
+    echo "✗ Nginx configuration has errors:"
+    nginx -t
     exit 1
 fi
-
-# Backup existing netplan config
-echo
-echo "Backing up existing netplan config..."
-cp /etc/netplan/*.yaml /etc/netplan/backup-$(date +%Y%m%d-%H%M%S).yaml 2>/dev/null || true
-
-# Create new netplan config
-NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
-echo "Creating new netplan configuration..."
-
-cat > $NETPLAN_FILE <<EOF
-network:
-  version: 2
-  ethernets:
-    $INTERFACE:
-      addresses:
-        - $STATIC_IP/$PREFIX
-      routes:
-        - to: default
-          via: $GATEWAY
-      nameservers:
-        addresses:
-          - $DNS
-          - 8.8.8.8
-EOF
-
-echo "✓ Netplan config created at: $NETPLAN_FILE"
 echo
 
-# Test netplan config
-echo "Testing netplan configuration..."
-if netplan try --timeout 10; then
-    echo "✓ Netplan configuration is valid"
+# Check 6: Nginx Config for LibreNMS
+echo "[6/8] Checking Nginx LibreNMS config..."
+if [ -f /etc/nginx/conf.d/librenms.conf ]; then
+    echo "✓ LibreNMS Nginx config exists"
+    echo "  FastCGI pass setting:"
+    grep "fastcgi_pass" /etc/nginx/conf.d/librenms.conf
+    
+    # Verify it points to correct socket
+    if grep -q "unix:/run/php-fpm-librenms.sock" /etc/nginx/conf.d/librenms.conf; then
+        echo "✓ FastCGI points to correct socket"
+    else
+        echo "✗ FastCGI socket path is incorrect"
+        echo "  Fixing..."
+        sed -i 's|fastcgi_pass unix:.*|fastcgi_pass unix:/run/php-fpm-librenms.sock;|' /etc/nginx/conf.d/librenms.conf
+        nginx -t && systemctl reload nginx
+        echo "✓ Fixed and reloaded Nginx"
+    fi
 else
-    echo "✗ Netplan configuration has errors"
-    echo "Restoring backup..."
-    cp /etc/netplan/backup-*.yaml $NETPLAN_FILE
+    echo "✗ LibreNMS Nginx config NOT found"
+    echo "  This needs to be created manually"
     exit 1
 fi
-
-echo
-echo "Applying network configuration..."
-netplan apply
-
-sleep 3
-
-# Test connectivity
-echo
-echo "Testing connectivity..."
 echo
 
-echo "[1/3] Testing gateway..."
-if ping -c 2 -W 2 $GATEWAY >/dev/null 2>&1; then
-    echo "✓ Gateway ($GATEWAY) is reachable"
+# Check 7: LibreNMS Directory Permissions
+echo "[7/8] Checking LibreNMS directory permissions..."
+if [ -d /opt/librenms/html ]; then
+    HTML_OWNER=$(stat -c "%U:%G" /opt/librenms/html)
+    echo "  /opt/librenms/html owner: $HTML_OWNER"
+    
+    # Fix ownership if needed
+    if [ "$HTML_OWNER" != "librenms:librenms" ] && [ "$HTML_OWNER" != "www-data:www-data" ]; then
+        echo "  Fixing ownership..."
+        chown -R librenms:librenms /opt/librenms
+        chmod 771 /opt/librenms
+    fi
+    
+    # Ensure www-data can read html directory
+    if [ ! -r /opt/librenms/html/index.php ]; then
+        echo "  Making html readable by www-data..."
+        chmod -R 755 /opt/librenms/html
+    fi
+    echo "✓ Directory permissions OK"
 else
-    echo "✗ Gateway ($GATEWAY) is NOT reachable"
+    echo "✗ /opt/librenms/html directory not found!"
+    exit 1
 fi
-
 echo
-echo "[2/3] Testing LDAP server (192.168.1.15)..."
-if ping -c 2 -W 2 192.168.1.15 >/dev/null 2>&1; then
-    echo "✓ LDAP server (192.168.1.15) is reachable"
+
+# Check 8: Test with curl
+echo "[8/8] Testing HTTP response..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/)
+echo "  HTTP Status Code: $HTTP_CODE"
+
+if [ "$HTTP_CODE" = "200" ]; then
+    echo "✓ Website is responding correctly!"
+elif [ "$HTTP_CODE" = "502" ]; then
+    echo "✗ Still getting 502 Bad Gateway"
+    echo
+    echo "Checking logs for more details..."
+    echo
+    echo "=== Nginx Error Log (last 20 lines) ==="
+    tail -20 /var/log/nginx/error.log
+    echo
+    echo "=== PHP-FPM Error Log (last 20 lines) ==="
+    tail -20 /var/log/php8.3-fpm.log
 else
-    echo "✗ LDAP server (192.168.1.15) is NOT reachable"
-    echo "  Check your network configuration and LDAP server"
+    echo "  HTTP code: $HTTP_CODE"
 fi
-
 echo
-echo "[3/3] Testing LDAP port 389..."
-if timeout 5 bash -c "cat < /dev/null > /dev/tcp/192.168.1.15/389" 2>/dev/null; then
-    echo "✓ LDAP port 389 is accessible"
-else
-    echo "✗ LDAP port 389 is NOT accessible"
-    echo "  Check firewall on LDAP server"
-fi
 
-echo
+# Final restart
 echo "=========================================="
-echo "Network Configuration Complete"
+echo "Performing final service restart..."
 echo "=========================================="
+systemctl restart php8.3-fpm
+sleep 2
+systemctl restart nginx
+sleep 2
+
 echo
-echo "Current IP: $STATIC_IP"
-echo "You can now access LibreNMS at: http://$STATIC_IP"
-echo
-echo "Next steps:"
-echo "1. Open browser to: http://$STATIC_IP"
-echo "2. Complete web installation wizard"
-echo "3. Login with LDAP credentials"
-echo
-echo "If you need to test LDAP manually:"
-echo "  ldapsearch -x -H ldap://192.168.1.15:389 -D \"cn=admin,dc=example,dc=com\" -w \"password\" -b \"dc=example,dc=com\""
-echo
+echo "Testing again after restart..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/)
+echo "HTTP Status Code: $HTTP_CODE"
+
+if [ "$HTTP_CODE" = "200" ]; then
+    echo
+    echo "=========================================="
+    echo "✓ SUCCESS! 502 Error Fixed!"
+    echo "=========================================="
+    echo
+    echo "You can now access LibreNMS at:"
+    echo "  http://192.168.1.17"
+    echo
+else
+    echo
+    echo "=========================================="
+    echo "Additional Troubleshooting Needed"
+    echo "=========================================="
+    echo
+    echo "Please run these commands manually:"
+    echo
+    echo "1. Check PHP-FPM status:"
+    echo "   systemctl status php8.3-fpm"
+    echo
+    echo "2. Check PHP-FPM logs:"
+    echo "   tail -50 /var/log/php8.3-fpm.log"
+    echo
+    echo "3. Check Nginx error log:"
+    echo "   tail -50 /var/log/nginx/error.log"
+    echo
+    echo "4. Verify socket exists:"
+    echo "   ls -la /run/php-fpm-librenms.sock"
+    echo
+    echo "5. Test PHP-FPM manually:"
+    echo "   su - librenms -c 'php /opt/librenms/html/index.php'"
+    echo
+fi
+
+exit 0
